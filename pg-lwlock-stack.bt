@@ -1,0 +1,30 @@
+#!/usr/bin/env bpftrace
+// $1 is path to the instrumented postgres binary
+
+// STRONGLY recommended to be called with BPFTRACE_CACHE_USER_SYMBOLS=1
+
+/*
+to generate
+BPFTRACE_CACHE_USER_SYMBOLS=1 /home/andres/src/pg-bpftrace/pg-lwlock-stack.bt \
+    /home/andres/build/postgres/dev-optimize/vpath/src/backend/postgres | \
+    /home/andres/src/flamegraph/stackcollapse-bpftrace.pl | \
+    /home/andres/src/flamegraph/flamegraph.pl > /tmp/flame.svg
+*/
+
+usdt:$1:postgresql:lwlock__wait__start
+{
+    @lock_start[tid] = nsecs;
+}
+
+usdt:$1:postgresql:lwlock__wait__done
+{
+    $delta = nsecs - @lock_start[tid];
+    delete(@lock_start[tid]);
+
+    @[ustack()] = sum($delta);
+}
+
+END
+{
+    clear(@lock_start);
+}

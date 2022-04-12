@@ -1,0 +1,28 @@
+#!/usr/bin/env bpftrace
+// $1 is path to the instrumented postgres binary
+
+usdt:$1:postgresql:smgr__md__read__start
+{
+    @in_read[tid] = 1;
+}
+
+usdt:$1:postgresql:smgr__md__read__done / @in_read[tid] >= 1 /
+{
+    delete(@in_read[tid]);
+}
+
+tracepoint:iomap:iomap_readahead / @in_read[tid] /
+{
+    @cache_misses[pid] = count();
+    @cache_miss_bytes[pid] = sum(((uint64)args->nr_pages * 4096));
+}
+
+interval:s:1
+{
+    print(@cache_misses);
+    print(@cache_miss_bytes);
+    clear(@cache_misses);
+    clear(@cache_miss_bytes);
+}
+
+END { clear(@in_read); }

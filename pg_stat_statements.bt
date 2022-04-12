@@ -1,0 +1,120 @@
+#!/usr/bin/env bpftrace
+// $1 is path to the instrumented postgres binary
+// $2 is the path to pg_stat_statements
+
+/*
+
+best used with json output format:
+BPFTRACE_CACHE_USER_SYMBOLS=1 \
+    ./pg_stat_statements.bt \
+        /path/to/postgres /path/to/pg_stat_statements.so > /tmp/data.json
+
+can be ingested with:
+- table & view definition: pg_stat_statements_ddl.sql
+- loading data: pg_stat_statements_load.sql
+ */
+
+uprobe:$2:pgss_ExecutorStart,
+uprobe:$2:pgss_ExecutorEnd,
+uprobe:$2:pgss_ProcessUtility,
+//uprobe:$2:pgss_planner,
+uprobe:$2:pgss_ExecutorRun
+{
+    @pgss[tid]++;
+}
+
+uretprobe:$2:pgss_ExecutorStart,
+uretprobe:$2:pgss_ExecutorEnd,
+uretprobe:$2:pgss_ProcessUtility,
+//uprobe:$2:pgss_planner,
+uretprobe:$2:pgss_ExecutorRun
+{
+    @pgss[tid]--;
+}
+
+tracepoint:syscalls:sys_exit_recvfrom / @pgss[tid] > 0 /
+{
+    if (args->ret > 0)
+    {
+        @pgss_recv[tid, @pgss[tid]] += ((uint64) args->ret);
+    }
+}
+
+tracepoint:syscalls:sys_exit_sendto / @pgss[tid] > 0 /
+{
+    if (args->ret > 0)
+    {
+        @pgss_send[tid, @pgss[tid]] += ((uint64) args->ret);
+    }
+}
+
+//tracepoint:writeback:writeback_mark_inode_dirty / @pgss[tid] > 0 /
+//{
+//    @pgss_dirtied[tid, @pgss[tid]] += ((uint64) 4096);
+//}
+
+tracepoint:iomap:iomap_readahead / @pgss[tid] /
+{
+    @pgss_read[tid, @pgss[tid]] += ((uint64)args->nr_pages * 4096);
+}
+
+uprobe:$1:PGSemaphoreLock
+{
+    @lock_start[tid] = nsecs;
+}
+
+uprobe:$1:PGSemaphoreUnlock /@lock_start[tid] != 0/
+{
+    $delta = nsecs - @lock_start[tid];
+    delete(@lock_start[tid]);
+    @pgss_lwlock_wait[tid, @pgss[tid]] += $delta;
+}
+
+uprobe:$2:pgss_store / arg1 != 0 /
+{
+     $queryid = arg1;
+
+     if (@pgss_send[tid, @pgss[tid]] > 0)
+     {
+         @stat_send[$queryid] = sum(@pgss_send[tid, @pgss[tid]]);
+         delete(@pgss_send[tid, @pgss[tid]]);
+     }
+
+     if (@pgss_recv[tid, @pgss[tid]] > 0)
+     {
+         @stat_recv[$queryid] = sum(@pgss_recv[tid, @pgss[tid]]);
+         delete(@pgss_recv[tid, @pgss[tid]]);
+     }
+
+     //if (@pgss_dirtied[tid, @pgss[tid]] > 0)
+     //{
+     //     @stat_dirtied[$queryid] = sum(@pgss_dirtied[tid, @pgss[tid]]);
+     //     delete(@pgss_dirtied[tid, @pgss[tid]]);
+     //}
+
+     if (@pgss_read[tid, @pgss[tid]] > 0)
+     {
+         @stat_read[$queryid] = sum(@pgss_read[tid, @pgss[tid]]);
+	 delete(@pgss_read[tid, @pgss[tid]]);
+     }
+
+     if (@pgss_lwlock_wait[tid, @pgss[tid]] > 0)
+     {
+         @stat_lwlock_wait[$queryid] = sum(@pgss_lwlock_wait[tid, @pgss[tid]]);
+	 delete(@pgss_lwlock_wait[tid, @pgss[tid]]);
+     }
+}
+
+END
+{
+    clear(@pgss);
+    clear(@pgss_send);
+    clear(@pgss_recv);
+    //clear(@pgss_dirtied);
+    clear(@pgss_read);
+    clear(@pgss_lwlock_wait);
+    clear(@lock_start);
+
+    print(@stat_lwlock_wait, 0, 1_000); // output in us instead of ns
+    clear(@stat_lwlock_wait);
+}

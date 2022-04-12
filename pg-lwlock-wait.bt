@@ -1,0 +1,31 @@
+#!/usr/bin/env bpftrace
+// $1 is path to the instrumented postgres binary
+
+usdt:$1:postgresql:lwlock__wait__start
+{
+    @lock_start[tid] = nsecs;
+}
+
+usdt:$1:postgresql:lwlock__wait__done
+{
+    $delta = nsecs - @lock_start[tid];
+    delete(@lock_start[tid]);
+
+    @lock_waits[str(uptr(arg0))] = count();
+    @lock_wait_duration[str(uptr(arg0))] = sum($delta);
+}
+
+interval:s:1
+{
+    printf("\nwaits in last second:\n");
+    print(@lock_waits);
+    clear(@lock_wait_duration);
+
+    print(@lock_waits);
+    clear(@lock_waits);
+}
+
+END
+{
+    clear(@lock_start);
+}
